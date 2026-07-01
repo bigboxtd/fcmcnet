@@ -1,7 +1,7 @@
 name: FreeMcServer Auto Renew
 
 on:
-  schedule:
+  #schedule:
     # 每 6 小时跑一次，按需调整（cron 为 UTC 时间）
     - cron: "0 */6 * * *"
   workflow_dispatch:
