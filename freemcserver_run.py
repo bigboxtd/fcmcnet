@@ -336,16 +336,58 @@ def solve_embedded_turnstile(page, timeout_s=45):
 
 # ---------------------------------------------------------------------------
 # profile 有效性检测
+#
+# 不能只看文件大小：Chromium 首次创建 profile 时哪怕一个 cookie 都没有，也会
+# 生成带完整表结构的空 SQLite 文件（体积可达 20KB+）。改用 sqlite3 真实查询
+# freemcserver 相关 cookie 记录数。
+# 新版 Chromium 把 Cookies 挪到了 Default/Network/Cookies，老版本在 Default/Cookies。
 # ---------------------------------------------------------------------------
 def has_valid_profile():
-    cookies_path = os.path.join(PROFILE_DIR, "Default", "Cookies")
-    if not os.path.exists(cookies_path):
-        print(f"Profile Cookies 文件不存在: {cookies_path}，跳过 Cookie 登录。")
+    import shutil
+    import sqlite3
+    import tempfile
+
+    candidates = [
+        os.path.join(PROFILE_DIR, "Default", "Network", "Cookies"),
+        os.path.join(PROFILE_DIR, "Default", "Cookies"),
+    ]
+    cookies_path = next((p for p in candidates if os.path.exists(p)), None)
+
+    if not cookies_path:
+        print("Profile 中未找到 Cookies 数据库文件，跳过 Cookie 登录。")
         return False
+
     size = os.path.getsize(cookies_path)
-    print(f"Profile Cookies 文件大小: {size} 字节")
-    if size <= 8192:
-        print("Cookies 文件过小（可能只有空库或 CF 临时 cookie），跳过 Cookie 登录。")
+    print(f"Profile Cookies 文件大小: {size} 字节 ({cookies_path})")
+
+    # Cookies 文件可能被浏览器锁，先复制到临时文件再查询
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+            tmp_path = tmp.name
+        shutil.copyfile(cookies_path, tmp_path)
+        conn = sqlite3.connect(tmp_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM cookies WHERE host_key LIKE '%freemcserver%'"
+            )
+            count = cur.fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"读取 Cookies 数据库失败（视为无效 profile）: {e}")
+        count = 0
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    print(f"freemcserver 相关 cookie 记录数: {count}")
+    if count <= 0:
+        print("没有查到任何 freemcserver 相关 cookie，判定为无效 profile，跳过 Cookie 登录。")
         return False
     return True
 
@@ -373,11 +415,18 @@ def try_cookie_login(page):
 
     try:
         body_text = page.locator("body").inner_text(timeout=3000)
-        if len(body_text.strip()) < 50:
-            print(f"页面内容过少（{len(body_text.strip())} 字符），视为 Cookie 失效。")
-            return False
+        body_low = body_text.strip().lower()
     except Exception as e:
         print(f"页面内容检查异常: {e}")
+        return False
+
+    # CF WAF 拦截页特征
+    if "why have i been blocked" in body_low or "cloudflare ray id" in body_low:
+        print("检测到 Cloudflare WAF 拦截页，当前 IP 被封，需要代理。")
+        return False
+
+    if len(body_low) < 50:
+        print(f"页面内容过少（{len(body_low)} 字符），视为 Cookie 失效。")
         return False
 
     print(f"Cookie 登录成功！当前 URL: {cur}")
@@ -401,6 +450,16 @@ def login_with_username_password(page):
     if "/user/login" not in page.url:
         print(f"[登录] 访问登录页后被重定向到 {page.url}，说明已处于登录状态，跳过表单步骤。")
         return True
+
+    # CF WAF 拦截检测：IP 被封时登录页也会返回拦截页
+    try:
+        body_low = page.locator("body").inner_text(timeout=3000).lower()
+        if "why have i been blocked" in body_low or "cloudflare ray id" in body_low:
+            print("❌ 检测到 Cloudflare WAF 拦截页！当前 IP 被封，代理未生效，终止登录。")
+            send_notification("❌ <b>FreeMcServer：IP 被 Cloudflare 封锁，代理未生效！</b>", SCREENSHOT_FILE)
+            return False
+    except Exception:
+        pass
 
     print("等待登录表单...")
     try:
