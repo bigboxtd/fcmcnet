@@ -28,7 +28,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- 裁剪历史运行记录，只保留最近 2 次，避免 Actions 页面堆积 ----
+      # ---- 裁剪历史运行记录，只保留最近 2 次 ----
       - name: Trim old workflow runs
         uses: actions/github-script@v7
         with:
@@ -60,8 +60,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache persistent profile
-        uses: actions/cache@v4
+      # ---- profile cache：只 restore，save 留到登录成功后手动做 ----
+      - name: Restore persistent profile
+        id: restore_cache
+        uses: actions/cache/restore@v4
         with:
           path: state/freemcserver_profile
           key: freemcserver-profile-${{ github.run_id }}
@@ -70,7 +72,7 @@ jobs:
 
       - name: Install system deps (Xvfb + ffmpeg + xdpyinfo)
         run: |
-          sudo apt-get update
+          sudo apt-get update -q
           sudo apt-get install -y xvfb ffmpeg x11-utils
 
       - name: Install Python deps
@@ -78,21 +80,37 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # ---- Xray 代理：启动后做连通性自检，失败降级直连而不是静默跑 ----
       - name: Set up Xray SOCKS5 proxy
         env:
           V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
         run: |
           if [ -z "$V2RAY_CONFIG" ]; then
-            echo "未配置 V2RAY_CONFIG secret，本次直连（不启动代理）。"
+            echo "未配置 V2RAY_CONFIG secret，本次直连。"
             echo "PROXY=" >> "$GITHUB_ENV"
             exit 0
           fi
-          curl -Lo xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+
+          curl -fsSL -Lo xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -o xray.zip -d xray
           echo "$V2RAY_CONFIG" > xray/config.json
+
           nohup ./xray/xray run -c xray/config.json > xray.log 2>&1 &
-          sleep 3
-          echo "PROXY=socks5://127.0.0.1:10808" >> "$GITHUB_ENV"
+          echo "XRAY_PID=$!" >> "$GITHUB_ENV"
+          sleep 4
+
+          # 连通性自检：通过代理访问 ip-api.com，打印出口 IP
+          if curl -fsSL --max-time 10 \
+              --proxy socks5h://127.0.0.1:10808 \
+              http://ip-api.com/json | python3 -m json.tool; then
+            echo "✅ 代理连通性检测通过"
+            echo "PROXY=socks5://127.0.0.1:10808" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ 代理连通性检测失败，打印 xray.log 后降级直连"
+            cat xray.log || true
+            echo "PROXY=" >> "$GITHUB_ENV"
+          fi
 
       - name: Start Xvfb
         run: |
@@ -101,6 +119,7 @@ jobs:
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
 
       - name: Run FreeMcServer renew script
+        id: run_script
         env:
           FMC_USERNAME: ${{ secrets.FMC_USERNAME }}
           FMC_PASSWORD: ${{ secrets.FMC_PASSWORD }}
@@ -112,8 +131,23 @@ jobs:
           ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
         run: |
           python freemcserver_run.py
+          # 脚本执行完成后，检查登录失败标志文件
+          if [ -f "state/freemcserver_login_failed" ]; then
+            echo "LOGIN_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "LOGIN_OK=true" >> "$GITHUB_ENV"
+          fi
 
-      - name: Upload screenshot & recording (always)
+      # ---- 只有登录成功才保存 profile，避免空白/失败 profile 污染缓存 ----
+      - name: Save persistent profile (login succeeded only)
+        if: env.LOGIN_OK == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: state/freemcserver_profile
+          key: freemcserver-profile-${{ github.run_id }}
+
+      # ---- 上传产物：截图 + 录屏 + xray 日志，三个都收 ----
+      - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -121,5 +155,6 @@ jobs:
           path: |
             freemcserver_debug_screenshot.png
             freemcserver_record.mp4
+            xray.log
           retention-days: 3
           if-no-files-found: ignore
