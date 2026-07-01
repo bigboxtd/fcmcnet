@@ -1,0 +1,116 @@
+name: FreeMcServer Auto Renew
+
+on:
+  schedule:
+    # 每 6 小时跑一次，按需调整（cron 为 UTC 时间）
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: freemcserver-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 裁剪历史运行记录，只保留最近 2 次，避免 Actions 页面堆积 ----
+      - name: Trim old workflow runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "freemcserver-renew.yml",
+              per_page: 100,
+            });
+            const finished = runs.data.workflow_runs
+              .filter(r => r.status === "completed")
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const toDelete = finished.slice(2);
+            for (const run of toDelete) {
+              try {
+                await github.rest.actions.deleteWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id,
+                });
+              } catch (e) {
+                console.log(`删除 run ${run.id} 失败: ${e.message}`);
+              }
+            }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache persistent profile
+        uses: actions/cache@v4
+        with:
+          path: state/freemcserver_profile
+          key: freemcserver-profile-${{ github.run_id }}
+          restore-keys: |
+            freemcserver-profile-
+
+      - name: Install system deps (Xvfb + ffmpeg + xdpyinfo)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb ffmpeg x11-utils
+
+      - name: Install Python deps
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Set up Xray SOCKS5 proxy
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          if [ -z "$V2RAY_CONFIG" ]; then
+            echo "未配置 V2RAY_CONFIG secret，本次直连（不启动代理）。"
+            echo "PROXY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          curl -Lo xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o xray.zip -d xray
+          echo "$V2RAY_CONFIG" > xray/config.json
+          nohup ./xray/xray run -c xray/config.json > xray.log 2>&1 &
+          sleep 3
+          echo "PROXY=socks5://127.0.0.1:10808" >> "$GITHUB_ENV"
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :99 -screen 0 1366x768x24 &
+          sleep 2
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Run FreeMcServer renew script
+        env:
+          FMC_USERNAME: ${{ secrets.FMC_USERNAME }}
+          FMC_PASSWORD: ${{ secrets.FMC_PASSWORD }}
+          FMC_SERVER_ID: ${{ secrets.FMC_SERVER_ID }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ENABLE_RECORDING: "true"
+        run: |
+          python freemcserver_run.py
+
+      - name: Upload screenshot & recording (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freemcserver-run-${{ github.run_id }}
+          path: |
+            freemcserver_debug_screenshot.png
+            freemcserver_record.mp4
+          retention-days: 3
+          if-no-files-found: ignore
