@@ -4,7 +4,16 @@ on:
   schedule:
     # 每 6 小时跑一次，按需调整（cron 为 UTC 时间）
     - cron: "0 */6 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      enable_recording:
+        description: "是否开启录屏（true=录屏 / false=不录屏）"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
 
 concurrency:
   group: freemcserver-renew
@@ -100,7 +109,7 @@ jobs:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ENABLE_RECORDING: "true"
+          ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
         run: |
           python freemcserver_run.py
 
