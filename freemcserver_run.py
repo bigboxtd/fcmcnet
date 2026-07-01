@@ -25,9 +25,14 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 
 import requests
+
+# 强制无缓冲输出，GitHub Actions 才能实时看到日志
+sys.stdout.reconfigure(line_buffering=False)
+sys.stderr.reconfigure(line_buffering=False)
 
 # ---------------------------------------------------------------------------
 # 环境变量
@@ -211,6 +216,22 @@ def screenshot(page, path=SCREENSHOT_FILE):
 # ---------------------------------------------------------------------------
 CLOSE_BUTTON_SELECTORS = [
     ".swal2-confirm",                      # SweetAlert2 确认/OK 按钮（验证码提示、续期成功提示都用它）
+    # Welcome / GDPR / Cookie 同意弹窗
+    "button.fc-button.fc-cta-consent",     # Funding Choices（freemcserver 用的 CMP）"Consent" 按钮
+    "button.fc-button.fc-cta-do-not-consent",
+    ".fc-footer-buttons button",           # Funding Choices 底部按钮（关闭/拒绝）
+    "button[aria-label*='consent' i]",
+    "button[aria-label*='agree' i]",
+    "button[aria-label*='accept' i]",
+    ".qc-cmp2-summary-buttons button",     # Quantcast CMP
+    "#onetrust-accept-btn-handler",        # OneTrust
+    ".cc-btn.cc-dismiss",                  # Cookie Consent
+    "[id*='cookie'] button",
+    "[class*='cookie-banner'] button",
+    "[class*='gdpr'] button",
+    "[class*='consent'] button[class*='close' i]",
+    "[class*='welcome'] button[class*='close' i]",
+    # 通用广告关闭
     "[aria-label='Close ad' i]",
     "[aria-label*='close' i]",
     "[title*='close' i]",
@@ -225,7 +246,9 @@ CLOSE_BUTTON_SELECTORS = [
     "[data-dismiss='modal']",
 ]
 
-CLOSE_TEXT_PATTERN = re.compile(r"^(close|skip ad|skip|×|✕)$", re.I)
+CLOSE_TEXT_PATTERN = re.compile(
+    r"^(close|skip ad|skip|×|✕|agree|accept|got it|i agree|consent|manage settings|ok)$", re.I
+)
 
 
 def try_close_overlays(page, verbose=False):
@@ -563,7 +586,13 @@ def go_to_renew_page(page):
     except Exception as e:
         print(f"续期页面加载异常: {e}")
     time.sleep(3)
-    try_close_overlays(page, verbose=True)
+    # 多轮清理：Welcome/GDPR/广告弹窗可能延迟弹出
+    print("清理续期页面弹窗...")
+    for _ in range(6):
+        closed = try_close_overlays(page, verbose=True)
+        time.sleep(1)
+        if not closed:
+            break
     screenshot(page)
 
 
@@ -595,23 +624,58 @@ def do_extended_renewal(page):
         btn.scroll_into_view_if_needed(timeout=5000)
     except Exception:
         pass
-    try_close_overlays(page)
-    time.sleep(0.5)
+
+    # 点击前：专门清理所有弹窗（Welcome/GDPR/广告），多轮确保干净
+    print("点击前清理弹窗（Welcome/GDPR/广告）...")
+    for _ in range(5):
+        closed = try_close_overlays(page, verbose=True)
+        time.sleep(1)
+        if not closed:
+            break
+    time.sleep(1)
+    screenshot(page)
 
     print("找到按钮，点击「Choose Extended Renewal」...")
-    try:
-        btn.click(timeout=8000)
-    except Exception as e:
-        print(f"点击「Choose Extended Renewal」失败: {e}")
-        try_close_overlays(page)
+    clicked_ok = False
+    for attempt in range(3):
         try:
-            btn.click(timeout=8000, force=True)
-        except Exception as e2:
-            print(f"强制点击仍然失败: {e2}")
-            screenshot(page)
-            return False
+            # 重新定位按钮（弹窗关掉后 DOM 可能刷新）
+            btn = find_extended_renewal_button(page)
+            if btn is None:
+                print(f"  第{attempt+1}次：按钮消失了，等待重新出现...")
+                time.sleep(2)
+                continue
+            btn.scroll_into_view_if_needed(timeout=3000)
+            btn.click(timeout=8000)
+            clicked_ok = True
+        except Exception as e:
+            print(f"  第{attempt+1}次点击失败: {e}，清理弹窗后重试...")
+            try_close_overlays(page, verbose=True)
+            time.sleep(1)
+            continue
 
-    time.sleep(3)
+        # 等待 URL 跳转（成功点击后应跳到 renew-with-ads）
+        deadline_click = time.time() + 8
+        while time.time() < deadline_click:
+            if "renew-with-ads" in page.url:
+                break
+            try_close_overlays(page)
+            time.sleep(1)
+
+        if "renew-with-ads" in page.url:
+            print(f"  URL 已跳转: {page.url}")
+            break
+        else:
+            print(f"  URL 未跳转（仍是 {page.url}），可能还有弹窗遮挡，再清理后重试...")
+            try_close_overlays(page, verbose=True)
+            time.sleep(1)
+
+    if not clicked_ok:
+        print("三次点击均失败。")
+        screenshot(page)
+        return False
+
+    time.sleep(2)
     screenshot(page)
 
     print(f"当前 URL: {page.url}")
@@ -757,6 +821,8 @@ def run():
 
     recording_proc = None
 
+    print("[1/5] 正在启动 CloakBrowser...", flush=True)
+    t0 = time.time()
     context = launch_persistent_context(
         PROFILE_DIR,
         headless=False,
@@ -766,12 +832,17 @@ def run():
         viewport={"width": XVFB_WIDTH, "height": XVFB_HEIGHT},
         args=[f"--fingerprint={FINGERPRINT_SEED}"],
     )
+    print(f"[2/5] CloakBrowser 启动完成（耗时 {time.time()-t0:.1f}s）。", flush=True)
 
     try:
+        print("[3/5] 创建新标签页...", flush=True)
         page = context.new_page()
+        print("[4/5] 新标签页已创建。", flush=True)
 
         if ENABLE_RECORDING:
             recording_proc = start_recording()
+
+        print("[5/5] 初始化完成，进入登录流程。", flush=True)
 
         if has_valid_profile():
             logged_in = try_cookie_login(page)
