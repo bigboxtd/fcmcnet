@@ -251,8 +251,17 @@ CLOSE_TEXT_PATTERN = re.compile(
 )
 
 
-def try_close_overlays(page, verbose=False):
+#  单次调用整体超时保护:
+#  Google Vignette 插页广告会往页面里注入大量跨域 iframe(doubleclick.net 等)。
+#  在这些 frame 上调用 frm.locator(sel).count() / is_visible(timeout=250) 等接口，
+#  某些 Playwright/CDP 场景下遇到"正在导航中"的跨域 frame 会不遵守单次调用自己声明
+#  的 timeout，导致单次调用被拖到远超预期。之前卡死 8 分钟大概率就是这里——每次
+#  循环调用 try_close_overlays 本身没有整体时间上限，多个 frame * 多个 selector 的
+#  overhead 叠加起来就会失控。这里给整个函数加一个硬性 max_duration，保证无论内部
+#  单个调用多慢，这个函数本身最多跑 max_duration 秒就必须返回。
+def try_close_overlays(page, verbose=False, max_duration=6.0):
     closed_any = False
+    call_deadline = time.time() + max_duration
 
     try:
         frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
@@ -260,7 +269,21 @@ def try_close_overlays(page, verbose=False):
         frames = [page.main_frame]
 
     for frm in frames:
+        if time.time() > call_deadline:
+            if verbose:
+                print(f"  [清理弹窗] 已达单次调用上限 {max_duration}s，提前返回，剩余 frame 留到下一轮再处理。")
+            break
+
+        # 跳过已经 detach/关闭的 frame，避免在其上调用接口时抛异常或卡住
+        try:
+            if frm.is_detached():
+                continue
+        except Exception:
+            continue
+
         for sel in CLOSE_BUTTON_SELECTORS:
+            if time.time() > call_deadline:
+                break
             try:
                 loc = frm.locator(sel)
                 cnt = loc.count()
@@ -268,6 +291,8 @@ def try_close_overlays(page, verbose=False):
                     continue
                 cnt = min(cnt, 4)
                 for i in range(cnt):
+                    if time.time() > call_deadline:
+                        break
                     el = loc.nth(i)
                     if not el.is_visible(timeout=250):
                         continue
@@ -281,6 +306,9 @@ def try_close_overlays(page, verbose=False):
                     time.sleep(0.25)
             except Exception:
                 continue
+
+        if time.time() > call_deadline:
+            break
 
         try:
             txt_loc = frm.get_by_text(CLOSE_TEXT_PATTERN)
@@ -636,8 +664,10 @@ def do_extended_renewal(page):
     screenshot(page)
 
     print("找到按钮，点击「Choose Extended Renewal」...")
-    clicked_ok = False
-    for attempt in range(3):
+    EXTENDED_RENEWAL_CLICK_RETRIES = 2  # 之前是 3 次，按需求改成 2 次
+    clicked_ok = False   # 是否成功点到按钮（不代表页面真的跳转了）
+    navigated_ok = False  # 是否真正跳转到了 renew-with-ads，这才是判断成功的依据
+    for attempt in range(EXTENDED_RENEWAL_CLICK_RETRIES):
         try:
             # 重新定位按钮（弹窗关掉后 DOM 可能刷新）
             btn = find_extended_renewal_button(page)
@@ -655,23 +685,36 @@ def do_extended_renewal(page):
             continue
 
         # 等待 URL 跳转（成功点击后应跳到 renew-with-ads）
-        deadline_click = time.time() + 8
+        # 注意: Google Vignette 插页广告经常会把 URL 变成
+        # ".../renew#google_vignette"——这只是插页广告加的锚点，不是真正跳转，
+        # 不能当作"已经跳转成功"来判断。
+        click_wait_start = time.time()
+        deadline_click = click_wait_start + 8
         while time.time() < deadline_click:
             if "renew-with-ads" in page.url:
                 break
+            if "google_vignette" in page.url:
+                print(f"  [{time.time()-click_wait_start:.0f}s] 检测到 Google Vignette 插页广告遮罩，尝试关闭...")
             try_close_overlays(page)
             time.sleep(1)
 
         if "renew-with-ads" in page.url:
             print(f"  URL 已跳转: {page.url}")
+            navigated_ok = True
             break
         else:
-            print(f"  URL 未跳转（仍是 {page.url}），可能还有弹窗遮挡，再清理后重试...")
+            print(f"  第{attempt+1}次：URL 未跳转（仍是 {page.url}），可能还有弹窗遮挡，再清理后重试...")
             try_close_overlays(page, verbose=True)
             time.sleep(1)
 
     if not clicked_ok:
-        print("三次点击均失败。")
+        print(f"{EXTENDED_RENEWAL_CLICK_RETRIES} 次点击均失败。")
+        screenshot(page)
+        return False
+
+    if not navigated_ok:
+        print(f"点击「Choose Extended Renewal」{EXTENDED_RENEWAL_CLICK_RETRIES} 次后页面始终未跳转到 renew-with-ads"
+              f"（当前 URL: {page.url}），大概率被 Google Vignette 广告遮罩卡住，放弃扩展续期，走回退流程。")
         screenshot(page)
         return False
 
@@ -689,9 +732,16 @@ def do_extended_renewal(page):
     screenshot(page)
 
     print("等待「Watch Ad and Renew!」按钮可点击...")
+    RENEW_BTN_TIMEOUT_S = 60  # 之前是约 40s (range(20)*2s) 且没有耗时日志，这里给明确超时并打日志
     watch_btn = page.locator("#renewBtn")
     clicked = False
-    for _ in range(20):
+    wait_start = time.time()
+    loop_i = 0
+    while time.time() - wait_start < RENEW_BTN_TIMEOUT_S:
+        loop_i += 1
+        elapsed = time.time() - wait_start
+        if loop_i % 5 == 0:  # 每 ~10s 打印一次进度，避免长时间静默
+            print(f"  [renewBtn] 仍在等待... 已过 {elapsed:.0f}s / {RENEW_BTN_TIMEOUT_S}s，当前 URL: {page.url}")
         try_close_overlays(page)
         try:
             if watch_btn.count() > 0 and watch_btn.is_visible(timeout=500):
@@ -700,13 +750,15 @@ def do_extended_renewal(page):
                     watch_btn.scroll_into_view_if_needed(timeout=3000)
                     watch_btn.click(timeout=5000)
                     clicked = True
+                    print(f"  [renewBtn] 点击成功，耗时 {elapsed:.0f}s。")
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            if loop_i % 5 == 0:
+                print(f"  [renewBtn] 定位/点击异常（继续重试）: {e}")
         time.sleep(2)
 
     if not clicked:
-        print("未能点击「Watch Ad and Renew!」按钮。")
+        print(f"未能点击「Watch Ad and Renew!」按钮（{RENEW_BTN_TIMEOUT_S}s 超时）。")
         screenshot(page)
         return False
 
@@ -776,9 +828,15 @@ def do_normal_renewal(page):
 
 
 def wait_for_renew_success(page, timeout_s=150):
-    deadline = time.time() + timeout_s
+    start = time.time()
+    deadline = start + timeout_s
     detected = False
+    loop_i = 0
     while time.time() < deadline:
+        loop_i += 1
+        elapsed = time.time() - start
+        if loop_i % 10 == 0:  # 每 ~20s 打印一次进度，避免长时间静默看不出是否卡住
+            print(f"  [等待续期结果] 仍在等待... 已过 {elapsed:.0f}s / {timeout_s}s，当前 URL: {page.url}")
         try:
             body_text = page.locator("body").inner_text(timeout=2000)
         except Exception:
@@ -786,11 +844,14 @@ def wait_for_renew_success(page, timeout_s=150):
         low = body_text.lower()
         if "server was renewed" in low or ("success" in low and "renew" in low):
             detected = True
-            print("[续期] 检测到「Success / Your server was renewed」提示。")
+            print(f"[续期] 检测到「Success / Your server was renewed」提示，耗时 {elapsed:.0f}s。")
             screenshot(page)
             break
         try_close_overlays(page)
         time.sleep(2)
+
+    if not detected:
+        print(f"[续期] 等待 {timeout_s}s 后仍未检测到成功提示。")
 
     keep_closing_ads(page, duration_s=4, interval=1)
     return detected
