@@ -130,7 +130,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
         run: |
-          python freemcserver_run.py
+          python -u freemcserver_run.py
           # 脚本执行完成后，检查登录失败标志文件
           if [ -f "state/freemcserver_login_failed" ]; then
             echo "LOGIN_OK=false" >> "$GITHUB_ENV"
