@@ -92,7 +92,7 @@ jobs:
           fi
 
           curl -fsSL -Lo xray.zip \
-            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+            https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip
           unzip -o xray.zip -d xray
           echo "$V2RAY_CONFIG" > xray/config.json
 
