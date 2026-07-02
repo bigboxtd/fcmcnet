@@ -335,6 +335,95 @@ def keep_closing_ads(page, duration_s, interval=1.5):
 
 
 # ---------------------------------------------------------------------------
+# 专门针对「Watch Ad and Renew!」点击后出现的插页广告（右上角纯文字/图标 "Close"）
+# 之前观察到的问题：这个 "Close" 有时候不在 CLOSE_BUTTON_SELECTORS 能命中的
+# class/aria-label 里，纯粹是一段文本；且它可能位于层层嵌套的广告 iframe
+# （doubleclick / googlesyndication 的 safeframe）里，普通 Playwright click()
+# 有时会因为元素被判定为"暂时不可交互"而抛异常，然后被上层 except 悄悄吞掉，
+# 导致这个广告永远关不掉，脚本干等到 150s 超时。
+# 这里做三件事强化命中率：
+#   1) 不再限制只处理前 3 个匹配，把所有匹配到的 "Close" 都试一遍
+#   2) 普通 click() 失败后，回退用 JS 原生 el.click() 再点一次
+#   3) 再失败的话，用 page.mouse.click(x, y) 点它的中心坐标（真实鼠标事件，
+#      对某些需要 "trusted event" 才会响应的广告 iframe 更有效，
+#      和脚本里处理 Turnstile 用的是同一个思路）
+#   4) verbose 日志默认开着，方便下次运行时在 Actions 日志里确认到底有没有
+#      找到、点没点、点的结果如何
+# ---------------------------------------------------------------------------
+AD_CLOSE_TEXT_PATTERN = re.compile(r"^close$", re.I)
+
+
+def force_close_ad_overlay(page, verbose=True):
+    closed_any = False
+    try:
+        frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
+    except Exception:
+        frames = [page.main_frame]
+
+    for frm in frames:
+        try:
+            if frm.is_detached():
+                continue
+        except Exception:
+            continue
+
+        try:
+            txt_loc = frm.get_by_text(AD_CLOSE_TEXT_PATTERN)
+            cnt = txt_loc.count()
+        except Exception:
+            cnt = 0
+
+        for i in range(cnt):
+            try:
+                el = txt_loc.nth(i)
+                if not el.is_visible(timeout=300):
+                    continue
+                box = el.bounding_box()
+                if not box or box["width"] <= 0 or box["height"] <= 0:
+                    continue
+            except Exception:
+                continue
+
+            ok = False
+            try:
+                el.click(timeout=1500, force=True)
+                ok = True
+                if verbose:
+                    print(f"  [关闭广告] Playwright click 成功命中 'Close' (frame={frm.url[:60]!r})")
+            except Exception as e:
+                if verbose:
+                    print(f"  [关闭广告] Playwright click 失败: {e}，尝试 JS click...")
+
+            if not ok:
+                try:
+                    el.evaluate("(e) => e.click()")
+                    ok = True
+                    if verbose:
+                        print("  [关闭广告] JS click() 成功。")
+                except Exception as e:
+                    if verbose:
+                        print(f"  [关闭广告] JS click 也失败: {e}，尝试鼠标坐标点击...")
+
+            if not ok:
+                try:
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    page.mouse.click(cx, cy)
+                    ok = True
+                    if verbose:
+                        print(f"  [关闭广告] 坐标点击 ({cx:.0f}, {cy:.0f}) 完成。")
+                except Exception as e:
+                    if verbose:
+                        print(f"  [关闭广告] 坐标点击也失败: {e}")
+
+            if ok:
+                closed_any = True
+                time.sleep(0.3)
+
+    return closed_any
+
+
+# ---------------------------------------------------------------------------
 # Cloudflare Turnstile（页面内嵌小组件，非整页拦截）处理
 # ---------------------------------------------------------------------------
 def click_turnstile(page):
@@ -835,7 +924,7 @@ def wait_for_renew_success(page, timeout_s=150):
     while time.time() < deadline:
         loop_i += 1
         elapsed = time.time() - start
-        if loop_i % 10 == 0:  # 每 ~20s 打印一次进度，避免长时间静默看不出是否卡住
+        if loop_i % 10 == 0:  # 每 ~10s 打印一次进度，避免长时间静默看不出是否卡住
             print(f"  [等待续期结果] 仍在等待... 已过 {elapsed:.0f}s / {timeout_s}s，当前 URL: {page.url}")
         try:
             body_text = page.locator("body").inner_text(timeout=2000)
@@ -847,8 +936,13 @@ def wait_for_renew_success(page, timeout_s=150):
             print(f"[续期] 检测到「Success / Your server was renewed」提示，耗时 {elapsed:.0f}s。")
             screenshot(page)
             break
+        # 「Watch Ad and Renew!」点击之后广告播放期间会持续弹出一个纯文字/图标的
+        # "Close"（右上角），普通的 try_close_overlays 有时点不掉它，导致广告一直
+        # 卡在那里、续期永远无法完成。这里额外用强化版关闭逻辑专门打这个目标。
         try_close_overlays(page)
-        time.sleep(2)
+        if force_close_ad_overlay(page, verbose=(loop_i % 5 == 0)):
+            print(f"  [等待续期结果] 已尝试关闭广告 'Close' 弹层（第 {elapsed:.0f}s）。")
+        time.sleep(1)
 
     if not detected:
         print(f"[续期] 等待 {timeout_s}s 后仍未检测到成功提示。")
