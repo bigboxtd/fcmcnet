@@ -1071,7 +1071,7 @@ def do_extended_renewal(page):
     print("已点击「Watch Ad and Renew!」，等待广告播放并持续清理弹窗...")
     time.sleep(2)
 
-    success = wait_for_renew_success(page, timeout_s=60)
+    success = wait_for_renew_success(page, timeout_s=120)
     screenshot(page)
     return success
 
@@ -1133,6 +1133,133 @@ def do_normal_renewal(page):
     return wait_for_renew_success(page, timeout_s=60)
 
 
+
+# ---------------------------------------------------------------------------
+# 等待并点击 Google Rewarded 广告的 Close 按钮
+#
+# 从 DevTools 截图确认的真实机制：
+#   - 广告容器在 googlesyndication safeframe iframe 里
+#   - 倒计时期间：#dismiss-button-element 是 display:none，不可点
+#   - 倒计时结束：#dismiss-button-element 变成 display:block（或 flex），
+#     div.continue-prompt-text 里的 "Close" 文字出现
+#   - 此时点击 div.continue-prompt-text（"Close" 文字那个 div）触发关闭回调
+#
+# 策略：
+#   1. 用 JS 轮询检测 #dismiss-button-element 的 display 是否非 none
+#   2. 一旦可见立刻用 frame 的 evaluate 触发 click()（不用 Playwright click，
+#      避免跨域 frame 坐标映射问题）
+#   3. 坐标点击作为最终兜底
+# ---------------------------------------------------------------------------
+_WAIT_CLOSE_JS = """
+(function() {
+    // 在当前 frame 内找 dismiss-button-element，检查是否可见
+    var el = document.getElementById('dismiss-button-element');
+    if (!el) return 'not_found';
+    var style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return 'hidden';
+    }
+    return 'visible';
+})()
+"""
+
+_CLICK_CLOSE_JS = """
+(function() {
+    // 优先点 continue-prompt-text（"Close" 文字本身），
+    // 其次点 dismiss-button-element，最后点 dismiss-button
+    var targets = [
+        document.querySelector('div.continue-prompt-text'),
+        document.getElementById('dismiss-button-element'),
+        document.getElementById('dismiss-button'),
+    ];
+    for (var i = 0; i < targets.length; i++) {
+        var el = targets[i];
+        if (el) {
+            el.click();
+            return 'clicked:' + (el.id || el.className);
+        }
+    }
+    return 'not_found';
+})()
+"""
+
+
+def click_rewarded_close_button(page, verbose=True):
+    """
+    在所有 safeframe frames 里执行 JS 检测+点击 Close 按钮。
+    只在 #dismiss-button-element 确认可见后才点击，避免点到倒计时中的无效区域。
+    返回 True 表示已触发点击。
+    """
+    try:
+        frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
+    except Exception:
+        frames = [page.main_frame]
+
+    for frm in frames:
+        try:
+            if frm.is_detached():
+                continue
+            frm_url = frm.url or ""
+        except Exception:
+            continue
+
+        is_ad_frame = (
+            "safeframe" in frm_url
+            or "googlesyndication" in frm_url
+            or "doubleclick" in frm_url
+        )
+        if not is_ad_frame:
+            continue
+
+        try:
+            status = frm.evaluate(_WAIT_CLOSE_JS)
+        except Exception as e:
+            if verbose:
+                print(f"  [Rewarded Close] frame JS 执行失败（{frm_url[:40]!r}）: {e}")
+            continue
+
+        if status == "not_found":
+            continue
+        if status == "hidden":
+            if verbose:
+                print(f"  [Rewarded Close] 广告倒计时还未结束（frame={frm_url[:40]!r}）")
+            continue
+
+        # status == "visible"，立刻点击
+        if verbose:
+            print(f"  [Rewarded Close] Close 按钮已可见，执行 JS click（frame={frm_url[:40]!r}）...")
+        try:
+            result = frm.evaluate(_CLICK_CLOSE_JS)
+            if verbose:
+                print(f"  [Rewarded Close] JS click 结果: {result}")
+            if result and not result.startswith("not_found"):
+                return True
+        except Exception as e:
+            if verbose:
+                print(f"  [Rewarded Close] JS click 异常: {e}")
+
+        # 兜底：坐标点击 dismiss-button-element
+        try:
+            el = frm.locator("#dismiss-button-element").first
+            if el.count() > 0:
+                box = el.bounding_box()
+                if box and box["width"] > 0:
+                    # bounding_box 返回的是相对 frame 的坐标，需要加上 frame 在页面中的偏移
+                    frame_el = frm.frame_element()
+                    frame_box = frame_el.bounding_box()
+                    if frame_box:
+                        cx = frame_box["x"] + box["x"] + box["width"] / 2
+                        cy = frame_box["y"] + box["y"] + box["height"] / 2
+                        page.mouse.click(cx, cy)
+                        if verbose:
+                            print(f"  [Rewarded Close] 坐标点击 ({cx:.0f}, {cy:.0f}) 完成。")
+                        return True
+        except Exception as e:
+            if verbose:
+                print(f"  [Rewarded Close] 坐标兜底失败: {e}")
+
+    return False
+
 def wait_for_renew_success(page, timeout_s=150):
     start = time.time()
     deadline = start + timeout_s
@@ -1153,13 +1280,14 @@ def wait_for_renew_success(page, timeout_s=150):
             print(f"[续期] 检测到「Success / Your server was renewed」提示，耗时 {elapsed:.0f}s。")
             screenshot(page)
             break
-        # 「Watch Ad and Renew!」点击之后会出现 Google Rewarded 插页广告（和跳转前
-        # 的 Vignette 是同一套 DOM 结构），必须等倒计时结束后点 Close 才能完成续期。
-        # 同时用两个函数覆盖：close_google_rewarded_ad 精确命中 #dismiss-button，
-        # force_close_ad_overlay 兜底处理其他情况。
+        # 注意：这里绝对不能调 nuke_ads！广告 DOM 删掉后播放回调永远不触发。
+        # 只做两件事：
+        #   1. try_close_overlays：处理 SweetAlert 续期成功弹窗的 OK 按钮
+        #   2. click_rewarded_close_button：检测广告倒计时是否结束，结束后点 Close
         try_close_overlays(page)
-        # 核弹清广告：每轮都调，幂等的，删完就没了，不影响续期成功检测
-        nuke_ads(page, verbose=(loop_i % 5 == 0))
+        verbose_this = (loop_i % 5 == 0)
+        if click_rewarded_close_button(page, verbose=verbose_this):
+            print(f"  [等待续期结果] 已点击广告 Close 按钮（第 {elapsed:.0f}s）。")
         time.sleep(1)
 
     if not detected:
