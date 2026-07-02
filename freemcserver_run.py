@@ -680,10 +680,10 @@ def solve_embedded_turnstile(page, timeout_s=45):
         try_close_overlays(page)
 
         if not clicked:
-            time.sleep(3)
+            time.sleep(1.5)
             if click_turnstile(page):
                 clicked = True
-        time.sleep(2)
+        time.sleep(1)
 
     print("  [Turnstile] 等待超时（可能已经通过但检测失败，继续往下走）。")
     return False
@@ -911,18 +911,21 @@ def find_normal_renewal_button(page):
     return None
 
 
-def go_to_renew_page(page):
-    print(f"访问续期页面: {RENEW_URL}")
-    try:
-        page.goto(RENEW_URL, wait_until="domcontentloaded", timeout=30000)
-    except Exception as e:
-        print(f"续期页面加载异常: {e}")
-    time.sleep(3)
+def go_to_renew_page(page, skip_goto=False):
+    if skip_goto:
+        print(f"已在续期页面，跳过 goto: {page.url}")
+    else:
+        print(f"访问续期页面: {RENEW_URL}")
+        try:
+            page.goto(RENEW_URL, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            print(f"续期页面加载异常: {e}")
+    time.sleep(1)
     # 多轮清理：Welcome/GDPR/广告弹窗可能延迟弹出
     print("清理续期页面弹窗...")
-    for _ in range(6):
+    for _ in range(3):
         closed = try_close_overlays(page, verbose=True)
-        time.sleep(1)
+        time.sleep(0.5)
         if not closed:
             break
     screenshot(page)
@@ -930,12 +933,14 @@ def go_to_renew_page(page):
 
 def do_extended_renewal(page):
     print("=== 开始「Extended Renewal」看广告续期流程 ===")
+    _t0 = time.time()
 
-    go_to_renew_page(page)
+    go_to_renew_page(page, skip_goto=(RENEW_URL and page.url.startswith(RENEW_URL)))
 
+    print(f"[时间] 续期页面就绪，耗时 {time.time()-_t0:.1f}s")
     print("向下滚动寻找「Choose Extended Renewal」按钮...")
     btn = None
-    for _ in range(15):
+    for _ in range(8):
         try_close_overlays(page)
         btn = find_extended_renewal_button(page)
         if btn is not None:
@@ -945,7 +950,7 @@ def do_extended_renewal(page):
             except Exception:
                 pass
         page.mouse.wheel(0, 400)
-        time.sleep(1)
+        time.sleep(0.5)
 
     if btn is None:
         print("未找到「Choose Extended Renewal」按钮。")
@@ -959,14 +964,14 @@ def do_extended_renewal(page):
 
     # 点击前：专门清理所有弹窗（Welcome/GDPR/广告），多轮确保干净
     print("点击前清理弹窗（Welcome/GDPR/广告）...")
-    for _ in range(5):
+    for _ in range(3):
         closed = try_close_overlays(page, verbose=True)
-        time.sleep(1)
+        time.sleep(0.5)
         if not closed:
             break
-    time.sleep(1)
     screenshot(page)
 
+    print(f"[时间] 找到续期按钮，耗时 {time.time()-_t0:.1f}s")
     print("找到按钮，点击「Choose Extended Renewal」...")
     # Google Rewarded/Vignette 广告出现时有 ~10-15s 倒计时，必须等它结束才能点 Close。
     # 原来 8s 等待不够，改成 30s；同时重试次数从 2 改到 3。
@@ -1002,7 +1007,7 @@ def do_extended_renewal(page):
                 print(f"  [{elapsed:.0f}s] 检测到 Google 插页广告遮罩，核弹清场...")
                 nuke_ads(page)
             try_close_overlays(page)
-            time.sleep(1)
+            time.sleep(0.5)
 
         if "renew-with-ads" in page.url:
             print(f"  URL 已跳转: {page.url}")
@@ -1027,10 +1032,11 @@ def do_extended_renewal(page):
     time.sleep(2)
     screenshot(page)
 
+    print(f"[时间] 跳转到 renew-with-ads，耗时 {time.time()-_t0:.1f}s")
     print(f"当前 URL: {page.url}")
 
     print("清理「Captcha is required」错误弹窗...")
-    keep_closing_ads(page, duration_s=6, interval=1)
+    keep_closing_ads(page, duration_s=3, interval=0.5)
 
     print("等待 Extended Renewal 页面 Turnstile 验证通过...")
     solve_embedded_turnstile(page, timeout_s=45)
@@ -1061,17 +1067,19 @@ def do_extended_renewal(page):
         except Exception as e:
             if loop_i % 5 == 0:
                 print(f"  [renewBtn] 定位/点击异常（继续重试）: {e}")
-        time.sleep(2)
+        time.sleep(1)
 
     if not clicked:
         print(f"未能点击「Watch Ad and Renew!」按钮（{RENEW_BTN_TIMEOUT_S}s 超时）。")
         screenshot(page)
         return False
 
+    print(f"[时间] Watch Ad 点击完成，耗时 {time.time()-_t0:.1f}s")
     print("已点击「Watch Ad and Renew!」，等待广告播放并持续清理弹窗...")
-    time.sleep(2)
+    time.sleep(0.5)
 
     success = wait_for_renew_success(page, timeout_s=60)
+    print(f"[时间] Extended Renewal 流程总耗时 {time.time()-_t0:.1f}s，结果: {success}")
     screenshot(page)
     return success
 
@@ -1324,7 +1332,6 @@ def wait_for_renew_success(page, timeout_s=150):
     if not detected:
         print(f"[续期] 等待 {timeout_s}s 后仍未检测到成功提示。")
 
-    keep_closing_ads(page, duration_s=4, interval=1)
     return detected
 
 
@@ -1388,6 +1395,9 @@ def run():
                 return
 
         LOGIN_SUCCESS = True
+
+        t_login_done = time.time()
+        print(f"[时间] 登录完成，耗时 {t_login_done - t0:.1f}s")
 
         success = do_extended_renewal(page)
 
