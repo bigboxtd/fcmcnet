@@ -1071,7 +1071,7 @@ def do_extended_renewal(page):
     print("已点击「Watch Ad and Renew!」，等待广告播放并持续清理弹窗...")
     time.sleep(2)
 
-    success = wait_for_renew_success(page, timeout_s=120)
+    success = wait_for_renew_success(page, timeout_s=60)
     screenshot(page)
     return success
 
@@ -1186,10 +1186,46 @@ _CLICK_CLOSE_JS = """
 
 def click_rewarded_close_button(page, verbose=True):
     """
-    在所有 safeframe frames 里执行 JS 检测+点击 Close 按钮。
-    只在 #dismiss-button-element 确认可见后才点击，避免点到倒计时中的无效区域。
-    返回 True 表示已触发点击。
+    寻找并用真实鼠标点击 Google Rewarded 广告的 Close 按钮。
+
+    从视频录屏确认：Close 是主页面右上角的纯文字（不在 safeframe 里），
+    DOM 路径大致是主页面最外层某个 fixed div 里的文字节点。
+    之前的 JS click 打到了 safeframe 内部的 continue-prompt-text，
+    那个点击不会触发主页面的关闭事件，所以广告一直没关掉。
+
+    策略（按优先级）：
+    1. 主页面找 get_by_text("Close") 且 is_visible → 获取 bounding_box → page.mouse.click
+    2. 扫描所有 frame，找 #dismiss-button-element display 非 none → 计算绝对坐标 → page.mouse.click
+    3. 固定坐标兜底（视频截图里 Close 约在 1241, 455）
     """
+    # ── 策略1：主页面文字匹配 ──────────────────────────────────────
+    import re as _re
+    close_pattern = _re.compile(r"^Close$")
+    try:
+        candidates = page.get_by_text(close_pattern).all()
+        for el in candidates:
+            try:
+                if not el.is_visible(timeout=300):
+                    continue
+                box = el.bounding_box()
+                if not box or box["width"] <= 0 or box["height"] <= 0:
+                    continue
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                if verbose:
+                    print(f"  [Rewarded Close] 主页面找到 'Close' 文字，bounding_box={box}，点击坐标 ({cx:.0f}, {cy:.0f})")
+                page.mouse.click(cx, cy)
+                if verbose:
+                    print(f"  [Rewarded Close] 鼠标点击完成。")
+                return True
+            except Exception as e:
+                if verbose:
+                    print(f"  [Rewarded Close] 主页面 Close 候选元素点击失败: {e}")
+    except Exception as e:
+        if verbose:
+            print(f"  [Rewarded Close] 主页面文字扫描异常: {e}")
+
+    # ── 策略2：扫描所有 frame 的 #dismiss-button-element ─────────────
     try:
         frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
     except Exception:
@@ -1203,62 +1239,57 @@ def click_rewarded_close_button(page, verbose=True):
         except Exception:
             continue
 
-        is_ad_frame = (
-            "safeframe" in frm_url
-            or "googlesyndication" in frm_url
-            or "doubleclick" in frm_url
-        )
-        if not is_ad_frame:
-            continue
-
         try:
-            status = frm.evaluate(_WAIT_CLOSE_JS)
-        except Exception as e:
-            if verbose:
-                print(f"  [Rewarded Close] frame JS 执行失败（{frm_url[:40]!r}）: {e}")
+            status = frm.evaluate("""
+(function() {
+    var el = document.getElementById('dismiss-button-element');
+    if (!el) return 'not_found';
+    var s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return 'hidden';
+    return 'visible';
+})()
+""")
+        except Exception:
             continue
 
-        if status == "not_found":
-            continue
-        if status == "hidden":
-            if verbose:
-                print(f"  [Rewarded Close] 广告倒计时还未结束（frame={frm_url[:40]!r}）")
+        if status != "visible":
+            if verbose and status == "hidden":
+                print(f"  [Rewarded Close] 倒计时未结束 (frame={frm_url[:50]!r})")
             continue
 
-        # status == "visible"，立刻点击
-        if verbose:
-            print(f"  [Rewarded Close] Close 按钮已可见，执行 JS click（frame={frm_url[:40]!r}）...")
+        # 找到了，算绝对坐标
         try:
-            result = frm.evaluate(_CLICK_CLOSE_JS)
-            if verbose:
-                print(f"  [Rewarded Close] JS click 结果: {result}")
-            if result and not result.startswith("not_found"):
+            frame_el = frm.frame_element()
+            frame_box = frame_el.bounding_box()
+            el = frm.locator("#dismiss-button-element").first
+            box = el.bounding_box()
+            if frame_box and box and box["width"] > 0:
+                cx = frame_box["x"] + box["x"] + box["width"] / 2
+                cy = frame_box["y"] + box["y"] + box["height"] / 2
+                if verbose:
+                    print(f"  [Rewarded Close] frame内 dismiss-button-element box={box}，frame偏移=({frame_box['x']:.0f},{frame_box['y']:.0f})，绝对点击坐标 ({cx:.0f}, {cy:.0f})")
+                page.mouse.click(cx, cy)
+                if verbose:
+                    print(f"  [Rewarded Close] 鼠标点击完成。")
                 return True
         except Exception as e:
             if verbose:
-                print(f"  [Rewarded Close] JS click 异常: {e}")
+                print(f"  [Rewarded Close] frame坐标计算失败: {e}")
 
-        # 兜底：坐标点击 dismiss-button-element
-        try:
-            el = frm.locator("#dismiss-button-element").first
-            if el.count() > 0:
-                box = el.bounding_box()
-                if box and box["width"] > 0:
-                    # bounding_box 返回的是相对 frame 的坐标，需要加上 frame 在页面中的偏移
-                    frame_el = frm.frame_element()
-                    frame_box = frame_el.bounding_box()
-                    if frame_box:
-                        cx = frame_box["x"] + box["x"] + box["width"] / 2
-                        cy = frame_box["y"] + box["y"] + box["height"] / 2
-                        page.mouse.click(cx, cy)
-                        if verbose:
-                            print(f"  [Rewarded Close] 坐标点击 ({cx:.0f}, {cy:.0f}) 完成。")
-                        return True
-        except Exception as e:
-            if verbose:
-                print(f"  [Rewarded Close] 坐标兜底失败: {e}")
+    # ── 策略3：固定坐标兜底（视频截图里 Close 约在右上角 1241, 455）─
+    if verbose:
+        print(f"  [Rewarded Close] 前两种策略均未命中，尝试固定坐标兜底 (1241, 455)...")
+    try:
+        page.mouse.click(1241, 455)
+        if verbose:
+            print(f"  [Rewarded Close] 固定坐标点击完成。")
+        return True
+    except Exception as e:
+        if verbose:
+            print(f"  [Rewarded Close] 固定坐标点击失败: {e}")
 
     return False
+
 
 def wait_for_renew_success(page, timeout_s=150):
     start = time.time()
