@@ -13,8 +13,10 @@ FreeMcServer.net 自动登录 + 续期（Extended Renewal / 看广告续期）
   8. 广告播放期间会有各种插页广告弹出，持续清理；等广告右上角出现 Close 就点掉
   9. 广告结束后站点自动完成续期，弹出 "Success / Your server was renewed" 提示框，点击 OK
 
-如果扩展续期（看广告）流程失败（比如广告不可用/按钮找不到），会自动回退尝试
-"Choose Normal Renewal"（普通续期，无需看广告）。
+如果扩展续期（看广告）流程失败（比如广告不可用/按钮找不到/被识别为拦截器），
+不会回退到 Normal Renewal，而是重新回到续期页面，重试 Extended Renewal
+（次数由 FMC_EXTENDED_RETRIES 控制），因为 Normal Renewal 续的时长更短，
+优先级低于「多试几次 Extended Renewal」。
 
 Profile 持久化: GitHub Actions Cache（不写入 git 历史，公开仓库安全）
 代理: Xray SOCKS5 本地代理，透传给 CloakBrowser
@@ -27,6 +29,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 import requests
 
@@ -42,6 +45,10 @@ SERVER_ID  = os.getenv("FMC_SERVER_ID", "").strip()
 RENEW_URL       = f"{BASE_URL}/server/{SERVER_ID}/renew" if SERVER_ID else None
 RENEW_ADS_URL   = f"{BASE_URL}/server/{SERVER_ID}/renew-with-ads" if SERVER_ID else None
 RENEW_BASIC_URL = f"{BASE_URL}/server/{SERVER_ID}/renew-basic" if SERVER_ID else None
+# 服务器主页：Server Expiration 到期时间卡片在这个页面上，不在 /renew 页面上
+# （从 DevTools 截图确认：<script>window.fmcs.server_expires_at = "..."</script>
+#  和 #server-expiration .badge-light 都只出现在 /server/{id} 主页）
+SERVER_HOME_URL = f"{BASE_URL}/server/{SERVER_ID}" if SERVER_ID else None
 
 USERNAME  = os.getenv("FMC_USERNAME")
 PASSWORD  = os.getenv("FMC_PASSWORD")
@@ -53,8 +60,12 @@ PROFILE_DIR = os.getenv("FMC_PROFILE_DIR", "state/freemcserver_profile")
 # SOCKS5 代理，空字符串 = 直连
 PROXY = os.getenv("PROXY", "socks5://127.0.0.1:10808").strip()
 
-# 是否在扩展续期失败时回退到普通续期
-FALLBACK_TO_NORMAL = os.getenv("FMC_FALLBACK_NORMAL", "true").strip().lower() == "true"
+# Extended Renewal 失败后不再回退到 Normal Renewal，而是重试 Extended Renewal 的次数
+# （1 表示总共尝试 1+1=2 次，以此类推）
+EXTENDED_RENEWAL_RETRIES = int(os.getenv("FMC_EXTENDED_RETRIES", "2"))
+
+BEFORE_SCREENSHOT_FILE = "freemcserver_before_renew.png"
+AFTER_SCREENSHOT_FILE  = "freemcserver_after_renew.png"
 
 # 录屏开关（GitHub Actions 里配合 Xvfb 有头模式使用）
 ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "true").strip().lower() == "true"
@@ -209,6 +220,120 @@ def screenshot(page, path=SCREENSHOT_FILE):
         page.screenshot(path=path)
     except Exception as e:
         print(f"截图失败: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 续期前 / 续期后状态快照：读取页面上的到期时间 + 截图
+#
+# 从 DevTools 截图确认的真实结构（在服务器主页 /server/{id}，不在 /renew 页面）：
+#   <script>window.fmcs.server_expires_at = "2026-07-02 09:11:06";</script>
+#   <div id="server-expiration">
+#     <span class="badge badge-light">Server Expires on: 2026-07-02 09:11:06 UTC</span>
+#   </div>
+# 优先直接读 window.fmcs.server_expires_at 这个 JS 变量（最干净，纯 "YYYY-MM-DD HH:MM:SS"），
+# 读不到再退化到读 badge 文本，最后再退化到全文正则搜 "expire" 兜底。
+# ---------------------------------------------------------------------------
+EXPIRY_TEXT_PATTERN = re.compile(
+    r"[^\n]{0,40}\b(expir\w*|renews?\s+(on|in)|valid\s+until)\b[^\n]{0,60}", re.I
+)
+EXPIRY_DT_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+
+
+def get_expiry_snapshot_text(page):
+    """
+    抓取到期时间，按可信度从高到低依次尝试：
+      1. window.fmcs.server_expires_at（JS 变量，最干净）
+      2. #server-expiration 卡片里的 .badge-light 文本
+      3. 全文正则搜 "expire" 兜底（可能是别的措辞时的最后手段）
+    抓不到返回 None。
+    """
+    try:
+        js_val = page.evaluate("() => (window.fmcs && window.fmcs.server_expires_at) || null")
+        if js_val:
+            return str(js_val).strip()
+    except Exception as e:
+        print(f"  读取 window.fmcs.server_expires_at 失败: {e}")
+
+    try:
+        badge = page.locator("#server-expiration .badge-light").first
+        if badge.count() > 0 and badge.is_visible(timeout=1000):
+            text = badge.inner_text(timeout=3000).strip()
+            if text:
+                return text
+    except Exception as e:
+        print(f"  读取 #server-expiration badge 文本失败: {e}")
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000)
+        m = EXPIRY_TEXT_PATTERN.search(body_text)
+        if m:
+            return " ".join(m.group(0).split())
+    except Exception as e:
+        print(f"  读取页面正文失败: {e}")
+
+    return None
+
+
+def parse_expiry_dt(text):
+    """从抓取到的到期时间文本里解析出 datetime（UTC，naive），解析不出返回 None。"""
+    if not text:
+        return None
+    m = EXPIRY_DT_PATTERN.search(text)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def capture_renew_snapshot(page, label, screenshot_path, goto_home_page=True):
+    """
+    续期前/续期后各调用一次：截图 + 抓到期时间，打印到日志。
+    到期时间卡片（Server Expiration）只在服务器主页 SERVER_HOME_URL 上，不在
+    /renew 页面上，所以默认会先跳转到主页再抓取；跳转失败则直接在当前页面尝试。
+
+    同时算出「抓取这一刻，距离到期还剩多少分钟」（remaining_minutes）。
+    这个字段比"续期前后到期时间的差值"更能反映续期是否真的成功——freemcserver
+    的到期时间是重置到固定的 6 小时窗口，不是无限累加，所以续期前的剩余时间
+    本来就可能已经接近 6 小时（比如快到期前又被别的机制刷新过），这种情况下
+    真续期成功后 delta 也可能很小甚至看不出明显跳变。真正可靠的信号是「续期后
+    这一刻剩余时间是不是被重置回接近满窗口」，跟续期前剩多少完全无关。
+    """
+    if goto_home_page and SERVER_HOME_URL:
+        try:
+            page.goto(SERVER_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.5)
+            try_close_overlays(page)
+        except Exception as e:
+            print(f"  [{label}] 跳转服务器主页失败（改为在当前页面尝试抓取）: {e}")
+
+    expiry_text = get_expiry_snapshot_text(page)
+    screenshot(page, path=screenshot_path)
+
+    captured_at_utc = datetime.utcnow()
+    expiry_dt = parse_expiry_dt(expiry_text)
+    remaining_minutes = None
+    if expiry_dt:
+        remaining_minutes = (expiry_dt - captured_at_utc).total_seconds() / 60
+
+    if expiry_text:
+        if remaining_minutes is not None:
+            print(f"[{label}] 服务器到期时间: {expiry_text}（此刻剩余约 {remaining_minutes:.0f} 分钟）")
+        else:
+            print(f"[{label}] 服务器到期时间: {expiry_text}（剩余时间解析失败）")
+    else:
+        print(f"[{label}] 未能提取到到期时间（已截图，可人工核对）。")
+
+    return {
+        "label": label,
+        "expiry_text": expiry_text,
+        "expiry_dt": expiry_dt,
+        "captured_at_utc": captured_at_utc,
+        "remaining_minutes": remaining_minutes,
+        "screenshot": screenshot_path,
+        "captured_at": time.time(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -438,43 +563,44 @@ def force_close_ad_overlay(page, verbose=True):
 #   2. 倒计时结束后 count-down-container 变成 display:none，dismiss-button 变得可交互。
 #   3. 这个 div 在 safeframe iframe 里，必须用 frm.locator() 遍历 frames 才能命中。
 # ---------------------------------------------------------------------------
-# 核弹级广告清除：直接用 JS 删除广告 DOM，不靠点击 Close 按钮
+# 广告遮罩清除：用 JS 删除广告的「遮罩层」，不删广告 iframe 本体
 #
-# 背景：Google Rewarded/Vignette 插页广告嵌在 safeframe iframe 里，
-# Close 按钮有倒计时保护且点击坐标难以精确命中（之前几轮调试都踩坑了）。
-# 最可靠的方案是绕过交互，直接在主页面 JS 层把广告容器整个删掉：
-#   1. 删除所有 googlesyndication / doubleclick safeframe iframe
-#   2. 删除 Google Interstitial / Vignette 的全屏遮罩 div
-#   3. 解锁 body overflow（广告弹出时通常会设 overflow:hidden 防止滚动）
-#   4. 清除 #google_vignette / #goog_rewarded hash，让页面 URL 恢复干净状态
+# 背景：Google Rewarded/Vignette 插页广告嵌在 safeframe iframe 里，会先弹出一层
+# 全屏遮罩（#google_vignette）挡住整个页面。之前的版本连广告 iframe 本体
+# （googlesyndication / doubleclick / aswift 等）一起删掉了，这些 iframe 是
+# 广告 SDK 自己的心跳检测节点，删掉后大概率被判定为开了广告拦截器，导致
+# 后续被导向 we-need-your-support 拦截页，续期永远无法触发。
 #
-# 这个函数不依赖任何 DOM 选择器精确度，直接暴力清场，副作用是页面上
-# 其他正常广告位也会被清掉——但续期流程里我们根本不在乎广告展示，
-# 只需要广告不挡住续期按钮和成功提示框就行。
+# 现在只做：
+#   1. 删除 Google Interstitial / Vignette 的全屏遮罩容器本身（不碰里面的 iframe）
+#   2. 解锁 body overflow（广告弹出时通常会设 overflow:hidden 防止滚动）
+#   3. 清除 #google_vignette / #goog_rewarded hash，让页面 URL 恢复干净状态
+# ---------------------------------------------------------------------------
+#
+# 重要修正（2026-07）：之前这里连广告 iframe 本体（safeframe / googlesyndication /
+# doubleclick / aswift 等）一起物理删除了，这些 iframe 正是广告 SDK 自己用来做
+# "心跳/存活检测"的节点——很多广告平台会定期检查这些节点是否还在 DOM 里，
+# 一旦发现被删除，就会判定用户开了广告拦截器，把后续请求导向
+# /we-need-your-support?r=adblock2 这个页面，导致 Extended Renewal 永远无法
+# 触发续期回调。这不是点击坐标准不准的问题，是「删除广告本体」这个动作本身
+# 有概率触发反广告拦截检测。
+#
+# 现在只删「遮罩层」本身（#google_vignette / #goog_rewarded 这两个外层容器，
+# 以及通用的全屏高 z-index 遮罩 div），不碰广告 iframe 节点，把 nuke_ads
+# 的作用范围收窄到"只解除页面被完全挡住/锁死滚动"这一件事上。
 # ---------------------------------------------------------------------------
 _NUKE_ADS_JS = """
 (function() {
     var removed = 0;
 
-    // 1. 删除所有广告相关 iframe（safeframe / doubleclick / googlesyndication）
-    var iframes = document.querySelectorAll(
-        'iframe[src*="safeframe"], iframe[src*="googlesyndication"], ' +
-        'iframe[src*="doubleclick"], iframe[id*="google_ads"], ' +
-        'iframe[name*="google_ads"], iframe[id*="aswift"]'
-    );
-    iframes.forEach(function(el) { el.remove(); removed++; });
-
-    // 2. 删除 Google Interstitial / Vignette 全屏遮罩容器
-    //    这些 div 通常是 position:fixed, z-index 极高，覆盖整个页面
+    // 1. 只删 Google Interstitial / Vignette 的外层遮罩容器本身。
+    //    注意：不删 iframe[src*="googlesyndication"] / iframe[id*="aswift"] 等
+    //    广告 iframe 本体——这些是广告 SDK 自己的心跳检测节点，删了容易被判定
+    //    为开了 adblock，导致后续进入 we-need-your-support 拦截页。
     var overlaySelectors = [
         '#google_vignette',
         '#goog_rewarded',
-        '[id^="google_ads_iframe"]',
         '[id*="interstitial"]',
-        'ins.adsbygoogle[data-ad-format="interstitial"]',
-        // GPT out-of-page slot 容器
-        'div[id*="aswift"]',
-        'div[id*="google_ads"]',
     ];
     overlaySelectors.forEach(function(sel) {
         document.querySelectorAll(sel).forEach(function(el) {
@@ -482,28 +608,29 @@ _NUKE_ADS_JS = """
         });
     });
 
-    // 3. 找所有 position:fixed 且 z-index > 9000 的 div（广告遮罩特征）删掉
-    //    排除页面本身的 header/topbar（通常有具体的 class）
+    // 2. 找所有 position:fixed 且 z-index > 9000 的 div（广告遮罩特征）删掉，
+    //    但明确跳过任何包含广告 iframe 的容器（避免连带删掉广告本体），
+    //    以及页面自己的 header/topbar。
     var allDivs = document.querySelectorAll('div');
     allDivs.forEach(function(el) {
         try {
             var style = window.getComputedStyle(el);
             var z = parseInt(style.zIndex, 10);
             if (style.position === 'fixed' && z > 9000) {
-                // 跳过页面自己的 topbar（有 .topbar class）
-                if (!el.closest('.topbar') && !el.closest('#main-wrapper > header')) {
-                    el.remove(); removed++;
-                }
+                if (el.closest('.topbar') || el.closest('#main-wrapper > header')) return;
+                // 跳过内部含广告 iframe 的遮罩，只删纯遮罩（没有 iframe 子节点的）
+                if (el.querySelector('iframe')) return;
+                el.remove(); removed++;
             }
         } catch(e) {}
     });
 
-    // 4. 解锁 body scroll（广告弹出时会锁 overflow）
+    // 3. 解锁 body scroll（广告弹出时会锁 overflow）
     document.body.style.overflow = '';
     document.body.style.position = '';
     document.documentElement.style.overflow = '';
 
-    // 5. 清除 URL hash（#google_vignette / #goog_rewarded）避免脚本误判 URL
+    // 4. 清除 URL hash（#google_vignette / #goog_rewarded）避免脚本误判 URL
     if (window.location.hash && (
         window.location.hash.includes('google_vignette') ||
         window.location.hash.includes('goog_rewarded')
@@ -518,8 +645,8 @@ _NUKE_ADS_JS = """
 
 def nuke_ads(page, verbose=True):
     """
-    直接用 JS 删除页面上所有广告相关 DOM 节点。
-    比点 Close 按钮可靠得多——不依赖倒计时、不依赖坐标精度、不依赖 frame 访问权限。
+    用 JS 只删除广告的「遮罩层」容器（不删广告 iframe 本体），解除页面被
+    全屏遮罩挡住/锁死滚动的问题，同时避免触发广告 SDK 的 adblock 心跳检测。
     返回删除的节点数量（>0 表示确实清掉了什么）。
     """
     try:
@@ -1204,7 +1331,13 @@ def click_rewarded_close_button(page, verbose=True):
     策略（按优先级）：
     1. 主页面找 get_by_text("Close") 且 is_visible → 获取 bounding_box → page.mouse.click
     2. 扫描所有 frame，找 #dismiss-button-element display 非 none → 计算绝对坐标 → page.mouse.click
-    3. 固定坐标兜底（视频截图里 Close 约在 1241, 455）
+    3. 固定坐标兜底（视频截图里 Close 约在 1241, 455）——这是「盲点」，
+       没有先确认页面上真的出现了 Close 按钮，纯粹是按经验坐标点一下。
+
+    返回值改成三态字符串，方便调用方区分"真的点中了"还是"只是盲点了一下"：
+      "real"  → 策略1或2成功定位到元素并点击（可信）
+      "blind" → 策略3兜底盲点点击（不代表真的点中了任何东西）
+      "none"  → 三种策略都没有触发点击动作（比如坐标点击本身也抛异常了）
     """
     # ── 策略1：主页面文字匹配 ──────────────────────────────────────
     import re as _re
@@ -1224,8 +1357,8 @@ def click_rewarded_close_button(page, verbose=True):
                     print(f"  [Rewarded Close] 主页面找到 'Close' 文字，bounding_box={box}，点击坐标 ({cx:.0f}, {cy:.0f})")
                 page.mouse.click(cx, cy)
                 if verbose:
-                    print(f"  [Rewarded Close] 鼠标点击完成。")
-                return True
+                    print(f"  [Rewarded Close] 鼠标点击完成（真实命中，策略1）。")
+                return "real"
             except Exception as e:
                 if verbose:
                     print(f"  [Rewarded Close] 主页面 Close 候选元素点击失败: {e}")
@@ -1278,25 +1411,27 @@ def click_rewarded_close_button(page, verbose=True):
                     print(f"  [Rewarded Close] frame内 dismiss-button-element box={box}，frame偏移=({frame_box['x']:.0f},{frame_box['y']:.0f})，绝对点击坐标 ({cx:.0f}, {cy:.0f})")
                 page.mouse.click(cx, cy)
                 if verbose:
-                    print(f"  [Rewarded Close] 鼠标点击完成。")
-                return True
+                    print(f"  [Rewarded Close] 鼠标点击完成（真实命中，策略2）。")
+                return "real"
         except Exception as e:
             if verbose:
                 print(f"  [Rewarded Close] frame坐标计算失败: {e}")
 
     # ── 策略3：固定坐标兜底（视频截图里 Close 约在右上角 1241, 455）─
+    # 注意：这一步没有先确认页面上真的有 Close 按钮出现在这个位置，
+    # 纯粹是按经验坐标盲点一下，点击成功不代表真的点中了任何东西。
     if verbose:
-        print(f"  [Rewarded Close] 前两种策略均未命中，尝试固定坐标兜底 (1241, 455)...")
+        print(f"  [Rewarded Close] 前两种策略均未命中，尝试固定坐标兜底盲点 (1241, 455)（未确认命中，仅盲点）...")
     try:
         page.mouse.click(1241, 455)
         if verbose:
-            print(f"  [Rewarded Close] 固定坐标点击完成。")
-        return True
+            print(f"  [Rewarded Close] 固定坐标兜底盲点完成（未确认是否真的点中）。")
+        return "blind"
     except Exception as e:
         if verbose:
-            print(f"  [Rewarded Close] 固定坐标点击失败: {e}")
+            print(f"  [Rewarded Close] 固定坐标兜底盲点也失败: {e}")
 
-    return False
+    return "none"
 
 
 def wait_for_renew_success(page, timeout_s=150):
@@ -1319,14 +1454,19 @@ def wait_for_renew_success(page, timeout_s=150):
             print(f"[续期] 检测到「Success / Your server was renewed」提示，耗时 {elapsed:.0f}s。")
             screenshot(page)
             break
-        # 注意：这里绝对不能调 nuke_ads！广告 DOM 删掉后播放回调永远不触发。
-        # 只做两件事：
+        # 注意：这里绝对不能调 nuke_ads 删除广告 iframe 本体！广告 DOM 删掉后
+        # 播放回调永远不触发（会被判定成 adblock）。只做两件事：
         #   1. try_close_overlays：处理 SweetAlert 续期成功弹窗的 OK 按钮
         #   2. click_rewarded_close_button：检测广告倒计时是否结束，结束后点 Close
         try_close_overlays(page)
         verbose_this = (loop_i % 5 == 0)
-        if click_rewarded_close_button(page, verbose=verbose_this):
-            print(f"  [等待续期结果] 已点击广告 Close 按钮（第 {elapsed:.0f}s）。")
+        click_result = click_rewarded_close_button(page, verbose=verbose_this)
+        # 只有策略1/2真的定位到元素并点击成功（"real"）才算「已点击」，
+        # 策略3的兜底盲点（"blind"）单独标注，避免误以为每次都是真的点中了广告。
+        if click_result == "real":
+            print(f"  [等待续期结果] ✅ 已真实命中并点击广告 Close 按钮（第 {elapsed:.0f}s）。")
+        elif click_result == "blind" and verbose_this:
+            print(f"  [等待续期结果] 🎯 兜底盲点了一次固定坐标（第 {elapsed:.0f}s，未确认是否真的点中）。")
         time.sleep(1)
 
     if not detected:
@@ -1399,20 +1539,86 @@ def run():
         t_login_done = time.time()
         print(f"[时间] 登录完成，耗时 {t_login_done - t0:.1f}s")
 
-        success = do_extended_renewal(page)
+        # 续期前快照：抓到期时间文本 + 截图，用于和续期后对比
+        before_snapshot = capture_renew_snapshot(page, "续期前", BEFORE_SCREENSHOT_FILE)
 
-        if not success and FALLBACK_TO_NORMAL:
-            print("扩展续期未确认成功，尝试回退到普通续期...")
-            success = do_normal_renewal(page)
+        # 不 fallback 到 Normal Renewal，失败就重新回到续期页面重试 Extended Renewal
+        renew_t0 = time.time()
+        success = False
+        total_attempts = 1 + EXTENDED_RENEWAL_RETRIES
+        for attempt in range(1, total_attempts + 1):
+            if attempt > 1:
+                print(f"=== Extended Renewal 第 {attempt}/{total_attempts} 次尝试（前一次未确认成功，重新回到续期页面重试）===")
+            success = do_extended_renewal(page)
+            if success:
+                break
+            if attempt < total_attempts:
+                time.sleep(2)
+        print(f"[时间] Extended Renewal 全部尝试耗时 {time.time()-renew_t0:.1f}s，共尝试 {attempt}/{total_attempts} 次，最终结果: {success}")
 
         RENEW_SUCCESS = success
 
+        # 续期后快照：只有确认续期成功才有意义去对比，跳转回服务器主页拿刷新后的到期时间
+        after_snapshot = None
         if success:
-            msg = "✅ <b>FreeMcServer 续期成功！</b>\n服务器过期时间已重置。"
+            after_snapshot = capture_renew_snapshot(page, "续期后", AFTER_SCREENSHOT_FILE, goto_home_page=True)
+
+        # 组装续期前后对比信息
+        compare_lines = []
+        duration_s = time.time() - renew_t0
+        compare_lines.append(f"⏱ 本次续期耗时: {duration_s:.0f}s（尝试 {attempt}/{total_attempts} 次）")
+
+        before_dt = before_snapshot.get("expiry_dt") if before_snapshot else None
+        after_dt = after_snapshot.get("expiry_dt") if after_snapshot else None
+        before_remaining = before_snapshot.get("remaining_minutes") if before_snapshot else None
+        after_remaining = after_snapshot.get("remaining_minutes") if after_snapshot else None
+
+        if before_snapshot and before_snapshot.get("expiry_text"):
+            rem_str = f"（剩余约 {before_remaining:.0f} 分钟）" if before_remaining is not None else ""
+            compare_lines.append(f"续期前到期时间: {before_snapshot['expiry_text']}{rem_str}")
+        if after_snapshot and after_snapshot.get("expiry_text"):
+            rem_str = f"（剩余约 {after_remaining:.0f} 分钟）" if after_remaining is not None else ""
+            compare_lines.append(f"续期后到期时间: {after_snapshot['expiry_text']}{rem_str}")
+
+        # server_expires_at 是数据库里的固定绝对时间戳，不会随真实时间流逝自己变化——
+        # 没有续期成功，它就是原地不动的同一个值；只有后台真的处理了续期请求，
+        # 才会把它改写成"续期那一刻 + 6小时"的新值。所以最直接可靠的判断就是：
+        # 续期后的 expires_at 是否比续期前大（哪怕只大一点点），而不是看差值幅度——
+        # 续期前可能本来就接近满窗口，这种情况下差值本来就小，用幅度阈值反而会
+        # 把真续期误判成失败，或者把失败误判成成功。
+        if before_dt and after_dt:
+            delta_seconds = (after_dt - before_dt).total_seconds()
+            if delta_seconds > 0:
+                compare_lines.append(
+                    f"✅ 到期时间从 {before_dt} 变成了 {after_dt}（+{delta_seconds/60:.1f} 分钟），"
+                    f"expires_at 确实被后台改写了，续期真实生效。"
+                )
+            elif delta_seconds == 0:
+                compare_lines.append(
+                    f"⚠️ 续期前后 expires_at 完全没变（都是 {before_dt}），说明后台并没有真的处理续期请求，"
+                    f"页面上的「Success」提示可能是误判，请人工核对截图/录屏。"
+                )
+            else:
+                compare_lines.append(f"⚠️ 到期时间反而变早了（{before_dt} → {after_dt}），请人工核对截图确认发生了什么。")
+        elif not (before_snapshot and before_snapshot.get("expiry_text")) and not (after_snapshot and after_snapshot.get("expiry_text")):
+            compare_lines.append("（未能提取到到期时间，请查看续期前/后截图人工核对）")
+
+        compare_text = "\n".join(compare_lines)
+        print("[续期前后对比]\n" + compare_text)
+
+        if success:
+            msg = f"✅ <b>FreeMcServer 续期成功！</b>\n服务器过期时间已重置。\n{compare_text}"
         else:
-            msg = "⚠️ <b>FreeMcServer 续期流程已跑完，但未能确认续期成功</b>\n请查看截图/录屏确认实际状态。"
+            msg = f"⚠️ <b>FreeMcServer 续期流程已跑完，但未能确认续期成功</b>\n请查看截图/录屏确认实际状态。\n{compare_text}"
         print(msg)
         send_notification(msg, SCREENSHOT_FILE)
+        # 续期前后截图各发一次，方便直接肉眼对比。WxPusher 消息接口不支持图片
+        # （见 _send_wxpusher 里的说明），所以这两张对比图只通过 Telegram 发送，
+        # 避免给 WxPusher 发无意义的纯文字重复消息。
+        if before_snapshot:
+            _send_telegram(f"📸 续期前截图（{before_snapshot['label']}）", BEFORE_SCREENSHOT_FILE)
+        if after_snapshot:
+            _send_telegram(f"📸 续期后截图（{after_snapshot['label']}）", AFTER_SCREENSHOT_FILE)
 
     except Exception as e:
         print(f"主流程异常: {e}")
