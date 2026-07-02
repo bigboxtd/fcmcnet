@@ -62,7 +62,7 @@ PROXY = os.getenv("PROXY", "socks5://127.0.0.1:10808").strip()
 
 # Extended Renewal 失败后不再回退到 Normal Renewal，而是重试 Extended Renewal 的次数
 # （1 表示总共尝试 1+1=2 次，以此类推）
-EXTENDED_RENEWAL_RETRIES = int(os.getenv("FMC_EXTENDED_RETRIES", "2"))
+EXTENDED_RENEWAL_RETRIES = int(os.getenv("FMC_EXTENDED_RETRIES", "1"))
 
 BEFORE_SCREENSHOT_FILE = "freemcserver_before_renew.png"
 AFTER_SCREENSHOT_FILE  = "freemcserver_after_renew.png"
@@ -1062,7 +1062,7 @@ def do_extended_renewal(page):
     print("=== 开始「Extended Renewal」看广告续期流程 ===")
     _t0 = time.time()
 
-    go_to_renew_page(page, skip_goto=(RENEW_URL and page.url.startswith(RENEW_URL)))
+    go_to_renew_page(page, skip_goto=False)
 
     print(f"[时间] 续期页面就绪，耗时 {time.time()-_t0:.1f}s")
     print("向下滚动寻找「Choose Extended Renewal」按钮...")
@@ -1346,6 +1346,15 @@ def click_rewarded_close_button(page, verbose=True):
         candidates = page.get_by_text(close_pattern).all()
         for el in candidates:
             try:
+                # 只处理主 frame 里的元素，避免点进广告 safeframe 内部的 "Close" 文字
+                try:
+                    owner_frame = el.owner_frame()
+                    if owner_frame is not None and owner_frame != page.main_frame:
+                        if verbose:
+                            print(f"  [Rewarded Close] 跳过 iframe 内 'Close' 元素 (frame={owner_frame.url[:60]!r})")
+                        continue
+                except Exception:
+                    pass  # owner_frame() 失败则不跳过，继续尝试
                 if not el.is_visible(timeout=300):
                     continue
                 box = el.bounding_box()
