@@ -438,6 +438,104 @@ def force_close_ad_overlay(page, verbose=True):
 #   2. 倒计时结束后 count-down-container 变成 display:none，dismiss-button 变得可交互。
 #   3. 这个 div 在 safeframe iframe 里，必须用 frm.locator() 遍历 frames 才能命中。
 # ---------------------------------------------------------------------------
+# 核弹级广告清除：直接用 JS 删除广告 DOM，不靠点击 Close 按钮
+#
+# 背景：Google Rewarded/Vignette 插页广告嵌在 safeframe iframe 里，
+# Close 按钮有倒计时保护且点击坐标难以精确命中（之前几轮调试都踩坑了）。
+# 最可靠的方案是绕过交互，直接在主页面 JS 层把广告容器整个删掉：
+#   1. 删除所有 googlesyndication / doubleclick safeframe iframe
+#   2. 删除 Google Interstitial / Vignette 的全屏遮罩 div
+#   3. 解锁 body overflow（广告弹出时通常会设 overflow:hidden 防止滚动）
+#   4. 清除 #google_vignette / #goog_rewarded hash，让页面 URL 恢复干净状态
+#
+# 这个函数不依赖任何 DOM 选择器精确度，直接暴力清场，副作用是页面上
+# 其他正常广告位也会被清掉——但续期流程里我们根本不在乎广告展示，
+# 只需要广告不挡住续期按钮和成功提示框就行。
+# ---------------------------------------------------------------------------
+_NUKE_ADS_JS = """
+(function() {
+    var removed = 0;
+
+    // 1. 删除所有广告相关 iframe（safeframe / doubleclick / googlesyndication）
+    var iframes = document.querySelectorAll(
+        'iframe[src*="safeframe"], iframe[src*="googlesyndication"], ' +
+        'iframe[src*="doubleclick"], iframe[id*="google_ads"], ' +
+        'iframe[name*="google_ads"], iframe[id*="aswift"]'
+    );
+    iframes.forEach(function(el) { el.remove(); removed++; });
+
+    // 2. 删除 Google Interstitial / Vignette 全屏遮罩容器
+    //    这些 div 通常是 position:fixed, z-index 极高，覆盖整个页面
+    var overlaySelectors = [
+        '#google_vignette',
+        '#goog_rewarded',
+        '[id^="google_ads_iframe"]',
+        '[id*="interstitial"]',
+        'ins.adsbygoogle[data-ad-format="interstitial"]',
+        // GPT out-of-page slot 容器
+        'div[id*="aswift"]',
+        'div[id*="google_ads"]',
+    ];
+    overlaySelectors.forEach(function(sel) {
+        document.querySelectorAll(sel).forEach(function(el) {
+            el.remove(); removed++;
+        });
+    });
+
+    // 3. 找所有 position:fixed 且 z-index > 9000 的 div（广告遮罩特征）删掉
+    //    排除页面本身的 header/topbar（通常有具体的 class）
+    var allDivs = document.querySelectorAll('div');
+    allDivs.forEach(function(el) {
+        try {
+            var style = window.getComputedStyle(el);
+            var z = parseInt(style.zIndex, 10);
+            if (style.position === 'fixed' && z > 9000) {
+                // 跳过页面自己的 topbar（有 .topbar class）
+                if (!el.closest('.topbar') && !el.closest('#main-wrapper > header')) {
+                    el.remove(); removed++;
+                }
+            }
+        } catch(e) {}
+    });
+
+    // 4. 解锁 body scroll（广告弹出时会锁 overflow）
+    document.body.style.overflow = '';
+    document.body.style.position = '';
+    document.documentElement.style.overflow = '';
+
+    // 5. 清除 URL hash（#google_vignette / #goog_rewarded）避免脚本误判 URL
+    if (window.location.hash && (
+        window.location.hash.includes('google_vignette') ||
+        window.location.hash.includes('goog_rewarded')
+    )) {
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+
+    return removed;
+})()
+"""
+
+
+def nuke_ads(page, verbose=True):
+    """
+    直接用 JS 删除页面上所有广告相关 DOM 节点。
+    比点 Close 按钮可靠得多——不依赖倒计时、不依赖坐标精度、不依赖 frame 访问权限。
+    返回删除的节点数量（>0 表示确实清掉了什么）。
+    """
+    try:
+        removed = page.evaluate(_NUKE_ADS_JS)
+        if verbose and removed:
+            print(f"  [核弹清广告] JS 删除了 {removed} 个广告节点。")
+        elif verbose:
+            print("  [核弹清广告] 未找到广告节点（可能已消失或还未加载）。")
+        return removed or 0
+    except Exception as e:
+        if verbose:
+            print(f"  [核弹清广告] JS 执行异常: {e}")
+        return 0
+
+
+# ---------------------------------------------------------------------------
 def close_google_rewarded_ad(page, verbose=True):
     """
     轮询尝试点击 Google Rewarded/Vignette 广告的 Close 按钮。
@@ -901,8 +999,8 @@ def do_extended_renewal(page):
                 break
             elapsed = time.time() - click_wait_start
             if "google_vignette" in page.url or "goog_rewarded" in page.url:
-                print(f"  [{elapsed:.0f}s] 检测到 Google 插页广告遮罩，尝试关闭...")
-                close_google_rewarded_ad(page)
+                print(f"  [{elapsed:.0f}s] 检测到 Google 插页广告遮罩，核弹清场...")
+                nuke_ads(page)
             try_close_overlays(page)
             time.sleep(1)
 
@@ -973,7 +1071,7 @@ def do_extended_renewal(page):
     print("已点击「Watch Ad and Renew!」，等待广告播放并持续清理弹窗...")
     time.sleep(2)
 
-    success = wait_for_renew_success(page, timeout_s=150)
+    success = wait_for_renew_success(page, timeout_s=60)
     screenshot(page)
     return success
 
@@ -1060,11 +1158,8 @@ def wait_for_renew_success(page, timeout_s=150):
         # 同时用两个函数覆盖：close_google_rewarded_ad 精确命中 #dismiss-button，
         # force_close_ad_overlay 兜底处理其他情况。
         try_close_overlays(page)
-        verbose_this = (loop_i % 5 == 0)
-        if close_google_rewarded_ad(page, verbose=verbose_this):
-            print(f"  [等待续期结果] 已关闭 Google 插页广告（第 {elapsed:.0f}s）。")
-        elif force_close_ad_overlay(page, verbose=verbose_this):
-            print(f"  [等待续期结果] 已关闭广告弹层（第 {elapsed:.0f}s）。")
+        # 核弹清广告：每轮都调，幂等的，删完就没了，不影响续期成功检测
+        nuke_ads(page, verbose=(loop_i % 5 == 0))
         time.sleep(1)
 
     if not detected:
