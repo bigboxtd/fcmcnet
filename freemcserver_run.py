@@ -1205,7 +1205,7 @@ def do_extended_renewal(page):
     print("已点击「Watch Ad and Renew!」，等待广告播放并持续清理弹窗...")
     time.sleep(0.5)
 
-    success = wait_for_renew_success(page, timeout_s=60)
+    success = wait_for_renew_success(page, timeout_s=150)
     print(f"[时间] Extended Renewal 流程总耗时 {time.time()-_t0:.1f}s，结果: {success}")
     screenshot(page)
     return success
@@ -1265,7 +1265,7 @@ def do_normal_renewal(page):
         except Exception:
             continue
 
-    return wait_for_renew_success(page, timeout_s=60)
+    return wait_for_renew_success(page, timeout_s=150)
 
 
 
@@ -1523,6 +1523,15 @@ def run():
     print(f"[2/5] CloakBrowser 启动完成（耗时 {time.time()-t0:.1f}s）。", flush=True)
 
     try:
+        # 注册 popup 自动关闭：广告点击可能弹出新标签页，全部立即关闭
+        def _close_popup(popup):
+            try:
+                popup.close()
+                print(f"  [popup] 自动关闭广告弹出标签页: {popup.url[:80]}")
+            except Exception:
+                pass
+        context.on("page", _close_popup)
+
         print("[3/5] 创建新标签页...", flush=True)
         page = context.new_page()
         print("[4/5] 新标签页已创建。", flush=True)
