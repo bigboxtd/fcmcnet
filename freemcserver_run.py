@@ -424,6 +424,123 @@ def force_close_ad_overlay(page, verbose=True):
 
 
 # ---------------------------------------------------------------------------
+# 专门处理 Google Rewarded / Vignette 插页广告的 Close 按钮
+#
+# 从 DevTools 截图拿到的真实 DOM 结构（在 googlesyndication.com safeframe 里）：
+#   div#dismiss-button  aria-label="Close ad" role="button"
+#     div.close-button-outer
+#       div.close-button  (id="dismiss-button-element")
+#         div.continue-prompt-text > "Close"
+#
+# 注意事项：
+#   1. 广告有 10-15s 倒计时（count-down-container），倒计时未结束时 dismiss-button
+#      存在但不响应点击（DOM 上没有 disabled，只是 JS 层面忽略事件）。
+#   2. 倒计时结束后 count-down-container 变成 display:none，dismiss-button 变得可交互。
+#   3. 这个 div 在 safeframe iframe 里，必须用 frm.locator() 遍历 frames 才能命中。
+# ---------------------------------------------------------------------------
+def close_google_rewarded_ad(page, verbose=True):
+    """
+    轮询尝试点击 Google Rewarded/Vignette 广告的 Close 按钮。
+    只要找到 dismiss-button 就尝试点击，点击失败通常意味着倒计时还没结束，稍后重试。
+    返回 True 表示成功点击。
+    """
+    try:
+        frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
+    except Exception:
+        frames = [page.main_frame]
+
+    # 按优先级尝试的选择器（从最精确到最宽泛）
+    REWARDED_SELECTORS = [
+        "#dismiss-button",                      # Google Rewarded 的主关闭容器 div
+        "div[aria-label='Close ad']",           # aria-label 匹配
+        "div[aria-label='Close ad' i]",
+        ".close-button-outer",                  # 外层按钮容器
+        "#dismiss-button-element",              # 内层关闭元素
+        "div.continue-prompt-text",             # 包含文字 "Close" 的 div
+    ]
+
+    for frm in frames:
+        try:
+            if frm.is_detached():
+                continue
+        except Exception:
+            continue
+
+        frm_url = ""
+        try:
+            frm_url = frm.url or ""
+        except Exception:
+            pass
+
+        # 只在广告相关 frame 里找（safeframe 或主页面）
+        is_ad_frame = (
+            "safeframe" in frm_url
+            or "googlesyndication" in frm_url
+            or "doubleclick" in frm_url
+            or frm == page.main_frame
+        )
+        if not is_ad_frame:
+            continue
+
+        for sel in REWARDED_SELECTORS:
+            try:
+                loc = frm.locator(sel)
+                cnt = loc.count()
+                if cnt == 0:
+                    continue
+            except Exception:
+                continue
+
+            for i in range(min(cnt, 3)):
+                try:
+                    el = loc.nth(i)
+                    if not el.is_visible(timeout=300):
+                        continue
+                    box = el.bounding_box()
+                    if not box or box["width"] <= 0 or box["height"] <= 0:
+                        continue
+                except Exception:
+                    continue
+
+                if verbose:
+                    print(f"  [关闭插页广告] 找到元素 {sel!r}（frame={frm_url[:50]!r}），尝试点击...")
+
+                # 方式一：Playwright force click
+                try:
+                    el.click(timeout=2000, force=True)
+                    if verbose:
+                        print(f"  [关闭插页广告] Playwright click 成功。")
+                    return True
+                except Exception as e:
+                    if verbose:
+                        print(f"  [关闭插页广告] Playwright click 失败: {e}")
+
+                # 方式二：JS click()
+                try:
+                    el.evaluate("(e) => e.click()")
+                    if verbose:
+                        print(f"  [关闭插页广告] JS click() 成功。")
+                    return True
+                except Exception as e:
+                    if verbose:
+                        print(f"  [关闭插页广告] JS click 失败: {e}")
+
+                # 方式三：坐标点击（trusted mouse event）
+                try:
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    page.mouse.click(cx, cy)
+                    if verbose:
+                        print(f"  [关闭插页广告] 坐标点击 ({cx:.0f}, {cy:.0f}) 完成。")
+                    return True
+                except Exception as e:
+                    if verbose:
+                        print(f"  [关闭插页广告] 坐标点击失败: {e}")
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Cloudflare Turnstile（页面内嵌小组件，非整页拦截）处理
 # ---------------------------------------------------------------------------
 def click_turnstile(page):
@@ -753,12 +870,14 @@ def do_extended_renewal(page):
     screenshot(page)
 
     print("找到按钮，点击「Choose Extended Renewal」...")
-    EXTENDED_RENEWAL_CLICK_RETRIES = 2  # 之前是 3 次，按需求改成 2 次
-    clicked_ok = False   # 是否成功点到按钮（不代表页面真的跳转了）
-    navigated_ok = False  # 是否真正跳转到了 renew-with-ads，这才是判断成功的依据
+    # Google Rewarded/Vignette 广告出现时有 ~10-15s 倒计时，必须等它结束才能点 Close。
+    # 原来 8s 等待不够，改成 30s；同时重试次数从 2 改到 3。
+    EXTENDED_RENEWAL_CLICK_RETRIES = 3
+    VIGNETTE_WAIT_S = 30  # 每次点击后等 URL 跳转的最长时间（含等倒计时）
+    clicked_ok = False
+    navigated_ok = False
     for attempt in range(EXTENDED_RENEWAL_CLICK_RETRIES):
         try:
-            # 重新定位按钮（弹窗关掉后 DOM 可能刷新）
             btn = find_extended_renewal_button(page)
             if btn is None:
                 print(f"  第{attempt+1}次：按钮消失了，等待重新出现...")
@@ -773,17 +892,17 @@ def do_extended_renewal(page):
             time.sleep(1)
             continue
 
-        # 等待 URL 跳转（成功点击后应跳到 renew-with-ads）
-        # 注意: Google Vignette 插页广告经常会把 URL 变成
-        # ".../renew#google_vignette"——这只是插页广告加的锚点，不是真正跳转，
-        # 不能当作"已经跳转成功"来判断。
+        # 等待 URL 跳转。Google Rewarded/Vignette 广告会加 #google_vignette / #goog_rewarded
+        # 锚点，不是真正跳转。广告有倒计时，等倒计时结束后点 Close 才能跳转。
         click_wait_start = time.time()
-        deadline_click = click_wait_start + 8
+        deadline_click = click_wait_start + VIGNETTE_WAIT_S
         while time.time() < deadline_click:
             if "renew-with-ads" in page.url:
                 break
-            if "google_vignette" in page.url:
-                print(f"  [{time.time()-click_wait_start:.0f}s] 检测到 Google Vignette 插页广告遮罩，尝试关闭...")
+            elapsed = time.time() - click_wait_start
+            if "google_vignette" in page.url or "goog_rewarded" in page.url:
+                print(f"  [{elapsed:.0f}s] 检测到 Google 插页广告遮罩，尝试关闭...")
+                close_google_rewarded_ad(page)
             try_close_overlays(page)
             time.sleep(1)
 
@@ -936,12 +1055,16 @@ def wait_for_renew_success(page, timeout_s=150):
             print(f"[续期] 检测到「Success / Your server was renewed」提示，耗时 {elapsed:.0f}s。")
             screenshot(page)
             break
-        # 「Watch Ad and Renew!」点击之后广告播放期间会持续弹出一个纯文字/图标的
-        # "Close"（右上角），普通的 try_close_overlays 有时点不掉它，导致广告一直
-        # 卡在那里、续期永远无法完成。这里额外用强化版关闭逻辑专门打这个目标。
+        # 「Watch Ad and Renew!」点击之后会出现 Google Rewarded 插页广告（和跳转前
+        # 的 Vignette 是同一套 DOM 结构），必须等倒计时结束后点 Close 才能完成续期。
+        # 同时用两个函数覆盖：close_google_rewarded_ad 精确命中 #dismiss-button，
+        # force_close_ad_overlay 兜底处理其他情况。
         try_close_overlays(page)
-        if force_close_ad_overlay(page, verbose=(loop_i % 5 == 0)):
-            print(f"  [等待续期结果] 已尝试关闭广告 'Close' 弹层（第 {elapsed:.0f}s）。")
+        verbose_this = (loop_i % 5 == 0)
+        if close_google_rewarded_ad(page, verbose=verbose_this):
+            print(f"  [等待续期结果] 已关闭 Google 插页广告（第 {elapsed:.0f}s）。")
+        elif force_close_ad_overlay(page, verbose=verbose_this):
+            print(f"  [等待续期结果] 已关闭广告弹层（第 {elapsed:.0f}s）。")
         time.sleep(1)
 
     if not detected:
